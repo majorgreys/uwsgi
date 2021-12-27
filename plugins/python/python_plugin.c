@@ -428,9 +428,15 @@ realstuff:
 
 void uwsgi_python_post_fork() {
 
+	// Need to acquire the gil when no master process is used as first worker
+	// will not have been forked like others
+	if (!uwsgi.master_process && uwsgi.mywid == 1) {
+		UWSGI_GET_GIL
+	}
+
 	if (uwsgi.i_am_a_spooler) {
 		UWSGI_GET_GIL
-	}	
+	}
 
 	// reset python signal flags so child processes can trap signals
 	if (up.call_osafterfork) {
@@ -1129,6 +1135,10 @@ void uwsgi_python_preinit_apps() {
 	up.loaders[LOADER_CALLABLE] = uwsgi_callable_loader;
 	up.loaders[LOADER_STRING_CALLABLE] = uwsgi_string_callable_loader;
 
+	// GIL was released in previous initialization steps but init_pyargv expects
+	// the GIL to be acquired
+	UWSGI_GET_GIL
+
 	init_pyargv();
 
         init_uwsgi_embedded_module();
@@ -1174,14 +1184,13 @@ ready:
 		upli = upli->next;
 	}
 
+	// Release the GIL before moving on forward with initialization
+	UWSGI_RELEASE_GIL
+
 }
 
 void uwsgi_python_init_apps() {
-
-	// lazy ?
-	if (uwsgi.mywid > 0) {
-		UWSGI_GET_GIL;
-	}
+	UWSGI_GET_GIL;
 
 	// prepare for stack suspend/resume
 	if (uwsgi.async > 0) {
@@ -1290,32 +1299,35 @@ next:
 			Py_INCREF(up.after_req_hook_args);
 		}
 	}
-	// lazy ?
-	if (uwsgi.mywid > 0) {
-		UWSGI_RELEASE_GIL;
-	}
+	UWSGI_RELEASE_GIL;
 
 }
 
-void uwsgi_python_master_fixup(int step) {
 
-	static int master_fixed = 0;
-	static int worker_fixed = 0;
+void uwsgi_python_pre_uwsgi_fork() {
+	if (uwsgi.has_threads) {
+		// Acquire the gil and import lock before forking in order to avoid
+		// deadlocks in workers
+		UWSGI_GET_GIL
+		_PyImport_AcquireLock();
+	}
+}
 
-	if (!uwsgi.master_process) return;
 
+void uwsgi_python_post_uwsgi_fork(int step) {
 	if (uwsgi.has_threads) {
 		if (step == 0) {
-			if (!master_fixed) {
-				UWSGI_RELEASE_GIL;
-				master_fixed = 1;
-			}
-		}	
+			// Release locks within master process
+			_PyImport_ReleaseLock();
+			UWSGI_RELEASE_GIL
+		}
 		else {
-			if (!worker_fixed) {
-				UWSGI_GET_GIL;
-				worker_fixed = 1;
-			}
+			// Ensure thread state and locks are cleaned up in child process
+#ifdef HAS_NOT_PyOS_AfterFork_Child
+			PyOS_AfterFork();
+#else
+			PyOS_AfterFork_Child();
+#endif
 		}
 	}
 }
@@ -1349,7 +1361,8 @@ void uwsgi_python_enable_threads() {
 		up.reset_ts = threaded_reset_ts;
 	}
 
-	
+	// Release the newly created gil from call to PyEval_InitThreads above
+	UWSGI_RELEASE_GIL
 
 	uwsgi_log("python threads support enabled\n");
 	
@@ -2090,7 +2103,6 @@ struct uwsgi_plugin python_plugin = {
 	.init_apps = uwsgi_python_init_apps,
 
 	.fixup = uwsgi_python_fixup,
-	.master_fixup = uwsgi_python_master_fixup,
 	.master_cycle = uwsgi_python_master_cycle,
 
 	.mount_app = uwsgi_python_mount_app,
@@ -2130,4 +2142,6 @@ struct uwsgi_plugin python_plugin = {
 
 	.worker = uwsgi_python_worker,
 
+	.pre_uwsgi_fork = uwsgi_python_pre_uwsgi_fork,
+	.post_uwsgi_fork = uwsgi_python_post_uwsgi_fork,
 };

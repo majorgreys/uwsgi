@@ -1,5 +1,6 @@
 #include <uwsgi.h>
 #include <Python.h>
+#include <pythread.h>
 
 #include <frameobject.h>
 
